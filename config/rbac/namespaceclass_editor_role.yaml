@@ -25,9 +25,3 @@ rules:
   - patch
   - update
   - watch
-- apiGroups:
-  - namespaceclass.akuity.io
-  resources:
-  - namespaceclasses/status
-  verbs:
-  - get

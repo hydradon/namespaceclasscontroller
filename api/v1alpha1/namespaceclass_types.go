@@ -5,49 +5,27 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 )
 
-// EDIT THIS FILE!  THIS IS SCAFFOLDING FOR YOU TO OWN!
-// NOTE: json tags are required.  Any new fields you add must have json tags for the fields to be serialized.
-
 // NamespaceClassSpec defines the desired state of NamespaceClass
 type NamespaceClassSpec struct {
-	// INSERT ADDITIONAL SPEC FIELDS - desired state of cluster
-	// Important: Run "make" to regenerate code after modifying this file
-	// The following markers will use OpenAPI v3 schema to validate the value
-	// More info: https://book.kubebuilder.io/reference/markers/crd-validation.html
-
-	// foo is an example field of NamespaceClass. Edit namespaceclass_types.go to remove/update
+	// resources are complete, namespaced Kubernetes objects written like normal manifests
+	// (any kind, including custom resources). Leave metadata.namespace empty: each object is
+	// created in every Namespace labeled namespaceclass.akuity.io/name=<this class>.
 	// +optional
-	Foo *string `json:"foo,omitempty"`
-}
-
-// NamespaceClassStatus defines the observed state of NamespaceClass.
-type NamespaceClassStatus struct {
-	// INSERT ADDITIONAL STATUS FIELD - define observed state of cluster
-	// Important: Run "make" to regenerate code after modifying this file
-
-	// For Kubernetes API conventions, see:
-	// https://github.com/kubernetes/community/blob/master/contributors/devel/sig-architecture/api-conventions.md#typical-status-properties
-
-	// conditions represent the current state of the NamespaceClass resource.
-	// Each condition has a unique type and reflects the status of a specific aspect of the resource.
-	//
-	// Standard condition types include:
-	// - "Available": the resource is fully functional
-	// - "Progressing": the resource is being created or updated
-	// - "Degraded": the resource failed to reach or maintain its desired state
-	//
-	// The status of each condition is one of True, False, or Unknown.
-	// +listType=map
-	// +listMapKey=type
-	// +optional
-	Conditions []metav1.Condition `json:"conditions,omitempty"`
+	// +listType=atomic
+	// +kubebuilder:validation:MaxItems=100
+	// +kubebuilder:validation:items:XEmbeddedResource
+	// +kubebuilder:validation:items:XPreserveUnknownFields
+	// +kubebuilder:validation:items:XValidation:rule="has(self.metadata) && has(self.metadata.name) && size(self.metadata.name) > 0",message="metadata.name is required"
+	// +kubebuilder:validation:items:XValidation:rule="!has(self.metadata) || !has(self.metadata.generateName)",message="metadata.generateName is not supported; set metadata.name"
+	Resources []runtime.RawExtension `json:"resources,omitempty"`
 }
 
 // +kubebuilder:object:root=true
-// +kubebuilder:subresource:status
-// +kubebuilder:resource:scope=Cluster
+// +kubebuilder:resource:scope=Cluster,shortName=nsclass
+// +kubebuilder:validation:XValidation:rule="size(self.metadata.name) <= 63",message="metadata.name must be at most 63 characters because it is used as a label value"
 
-// NamespaceClass is the Schema for the namespaceclasses API
+// NamespaceClass lists Kubernetes objects that the controller creates in every Namespace
+// labeled namespaceclass.akuity.io/name=<name of this class>.
 type NamespaceClass struct {
 	metav1.TypeMeta `json:",inline"`
 
@@ -58,10 +36,6 @@ type NamespaceClass struct {
 	// spec defines the desired state of NamespaceClass
 	// +required
 	Spec NamespaceClassSpec `json:"spec"`
-
-	// status defines the observed state of NamespaceClass
-	// +optional
-	Status NamespaceClassStatus `json:"status,omitzero"`
 }
 
 // +kubebuilder:object:root=true

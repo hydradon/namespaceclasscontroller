@@ -19,9 +19,3 @@ rules:
   - namespaceclasses
   verbs:
   - '*'
-- apiGroups:
-  - namespaceclass.akuity.io
-  resources:
-  - namespaceclasses/status
-  verbs:
-  - get
