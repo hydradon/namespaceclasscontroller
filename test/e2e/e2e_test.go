@@ -4,7 +4,6 @@ package e2e
 
 import (
 	"fmt"
-	"os/exec"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -71,53 +70,7 @@ var (
 )
 
 var _ = Describe("NamespaceClass controller", Ordered, func() {
-	// Before running the tests, set up the environment by creating the namespace, enforcing the
-	// restricted security policy on it, installing the CRD, and deploying the controller.
-	BeforeAll(func() {
-		By("creating the manager namespace")
-		_, err := utils.Kubectl("create", "ns", managerNamespace)
-		Expect(err).NotTo(HaveOccurred(), "Failed to create namespace")
-
-		By("labeling the namespace to enforce the restricted security policy")
-		_, err = utils.Kubectl("label", "--overwrite", "ns", managerNamespace,
-			"pod-security.kubernetes.io/enforce=restricted")
-		Expect(err).NotTo(HaveOccurred(), "Failed to label namespace with restricted policy")
-
-		By("installing CRDs")
-		_, err = utils.Run(exec.Command("make", "install"))
-		Expect(err).NotTo(HaveOccurred(), "Failed to install CRDs")
-
-		By("deploying the controller-manager")
-		_, err = utils.Run(exec.Command("make", "deploy", "IMG="+managerImage))
-		Expect(err).NotTo(HaveOccurred(), "Failed to deploy the controller-manager")
-	})
-
-	// After all tests have been executed, clean up by deleting the sample namespaces, undeploying
-	// the controller, uninstalling the CRD, and deleting the manager namespace.
-	AfterAll(func() {
-		By("deleting the sample namespaces")
-		_, _ = utils.Kubectl("delete", "ns", webPortal, billing, teamA, legacy, "--ignore-not-found")
-
-		By("undeploying the controller-manager")
-		_, _ = utils.Run(exec.Command("make", "undeploy"))
-
-		By("uninstalling CRDs")
-		_, _ = utils.Run(exec.Command("make", "uninstall"))
-
-		By("removing manager namespace")
-		_, _ = utils.Kubectl("delete", "ns", managerNamespace, "--ignore-not-found")
-	})
-
-	// After each test, check for failures and collect logs, events, and pod descriptions for debugging.
-	AfterEach(func() {
-		if !CurrentSpecReport().Failed() {
-			return
-		}
-		printKubectl("controller logs", "logs", "-l", "control-plane=controller-manager", "-n", managerNamespace)
-		printKubectl("Kubernetes events", "get", "events", "-A", "--sort-by=.lastTimestamp")
-		printKubectl("controller pod description", "describe", "pod", "-l", "control-plane=controller-manager",
-			"-n", managerNamespace)
-	})
+	AfterAll(deleteSampleObjects)
 
 	SetDefaultEventuallyTimeout(2 * time.Minute)
 	SetDefaultEventuallyPollingInterval(time.Second)
@@ -291,6 +244,14 @@ var _ = Describe("NamespaceClass controller", Ordered, func() {
 		Eventually(recorded).Should(BeEmpty())
 	})
 })
+
+// deleteSampleObjects deletes the sample namespaces and classes. kubectl waits until the namespaces
+// are gone, so the next container (the specs or the demo) starts from a clean cluster.
+func deleteSampleObjects() {
+	By("deleting the sample namespaces and classes")
+	_, _ = utils.Kubectl("delete", "ns", webPortal, billing, teamA, legacy, "--ignore-not-found", "--timeout=2m")
+	_, _ = utils.Kubectl("delete", "nsclass", publicNetwork, internalNetwork, teamBaseline, "--ignore-not-found")
+}
 
 // eventsOf returns the kubectl arguments that list the events of a namespace. Events about a
 // cluster-scoped object such as a Namespace are stored in the default namespace.

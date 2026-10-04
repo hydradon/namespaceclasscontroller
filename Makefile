@@ -67,21 +67,24 @@ KIND_CLUSTER ?= namespaceclass-test-e2e
 # Every kind/e2e/demo target uses this kubeconfig, so your current kubectl context is never touched.
 KIND_KUBECONFIG ?= $(LOCALBIN)/kind-$(KIND_CLUSTER).kubeconfig
 KIND_IMG ?= namespaceclass-controller:dev
+# Ginkgo label filter for the e2e specs. The default skips the spec that runs hack/demo.sh;
+# E2E_LABEL_FILTER=demo runs only that spec.
+E2E_LABEL_FILTER ?= !demo
 
 .PHONY: setup-test-e2e
-setup-test-e2e: kind
+setup-test-e2e: kind ## Create the kind cluster KIND_CLUSTER unless it exists.
 	@case "$$("$(KIND)" get clusters)" in *"$(KIND_CLUSTER)"*) ;; \
 	  *) "$(KIND)" create cluster --name "$(KIND_CLUSTER)" --kubeconfig "$(KIND_KUBECONFIG)" ;; esac
 	@"$(KIND)" export kubeconfig --name "$(KIND_CLUSTER)" --kubeconfig "$(KIND_KUBECONFIG)"
 
 .PHONY: test-e2e
-test-e2e: setup-test-e2e manifests generate fmt vet
+test-e2e: setup-test-e2e manifests generate fmt vet ## Run the e2e tests on kind, then delete the cluster.
 	KUBECONFIG="$(KIND_KUBECONFIG)" KIND="$(KIND)" KIND_CLUSTER="$(KIND_CLUSTER)" KIND_IMG="$(KIND_IMG)" \
-		go test -tags=e2e ./test/e2e/ -v -ginkgo.v -timeout 30m
+		go test -tags=e2e ./test/e2e/ -v -ginkgo.v -ginkgo.label-filter='$(E2E_LABEL_FILTER)' -timeout 30m
 	$(MAKE) cleanup-test-e2e
 
 .PHONY: cleanup-test-e2e
-cleanup-test-e2e: kind
+cleanup-test-e2e: kind ## Delete the kind cluster KIND_CLUSTER.
 	@"$(KIND)" delete cluster --name "$(KIND_CLUSTER)" --kubeconfig "$(KIND_KUBECONFIG)"
 
 .PHONY: kind-deploy
@@ -89,6 +92,10 @@ kind-deploy: setup-test-e2e ## Build, load and deploy the controller into the ki
 	$(MAKE) docker-build IMG="$(KIND_IMG)"
 	"$(KIND)" load docker-image "$(KIND_IMG)" --name "$(KIND_CLUSTER)"
 	KUBECONFIG="$(KIND_KUBECONFIG)" $(MAKE) install deploy IMG="$(KIND_IMG)"
+
+.PHONY: demo-check
+demo-check: ## Run hack/demo.sh without pauses against the kind cluster.
+	KUBECONFIG="$(KIND_KUBECONFIG)" NONINTERACTIVE=1 hack/demo.sh
 
 .PHONY: lint
 lint: golangci-lint ## Run golangci-lint linter
