@@ -1,0 +1,17 @@
+namespace: namespaceclass-system
+namePrefix: namespaceclass-
+
+resources:
+- ../crd
+- ../rbac
+- ../manager
+- metrics_service.yaml
+
+patches:
+- path: manager_metrics_patch.yaml
+  target:
+    kind: Deployment
+
+# kubebuilder markers for conversion webhooks; do not remove.
+# +kubebuilder:scaffold:crdkustomizecainjectionns
+# +kubebuilder:scaffold:crdkustomizecainjectionname

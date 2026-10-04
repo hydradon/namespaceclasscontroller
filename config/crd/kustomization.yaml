@@ -1,0 +1,6 @@
+resources:
+- bases/namespaceclass.akuity.io_namespaceclasses.yaml
+# +kubebuilder:scaffold:crdkustomizeresource
+
+patches:
+# +kubebuilder:scaffold:crdkustomizewebhookpatch
