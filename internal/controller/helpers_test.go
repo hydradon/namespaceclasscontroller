@@ -21,6 +21,7 @@ import (
 	"k8s.io/client-go/util/retry"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/envtest"
+	"sigs.k8s.io/controller-runtime/pkg/metrics"
 
 	"github.com/hydradon/namespaceclasscontroller/api/v1alpha1"
 	"github.com/hydradon/namespaceclasscontroller/internal/inventory"
@@ -149,8 +150,12 @@ func expectAnnotation(ns *corev1.Namespace, objs ...*unstructured.Unstructured) 
 	Eventually(managedResources(ns)).Should(Equal(inventory.Encode(inventory.RefsOf(objs))))
 }
 
-// specField is the top-level spec field of an object.
-const specField = "spec"
+// Field names and data keys used by the test objects.
+const (
+	specField = "spec"  // the top-level spec field of an object
+	sizeField = "size"  // spec.size of a Widget or a Gizmo
+	colorKey  = "color" // a data key of test ConfigMaps
+)
 
 func newItem(apiVersion, kind, name string, fields map[string]any) *unstructured.Unstructured {
 	obj := &unstructured.Unstructured{Object: map[string]any{}}
@@ -206,7 +211,7 @@ func roleBinding(name, clusterRole string) *unstructured.Unstructured {
 
 func widget(name string, size int64) *unstructured.Unstructured {
 	return newItem("widget.example.com/v1", "Widget", name, map[string]any{
-		specField: map[string]any{"size": size},
+		specField: map[string]any{sizeField: size},
 	})
 }
 
@@ -216,19 +221,80 @@ func gadget(name string) *unstructured.Unstructured {
 	})
 }
 
+func gizmo(name string, size int64) *unstructured.Unstructured {
+	return newItem("gizmo.example.com/v1", "Gizmo", name, map[string]any{
+		specField: map[string]any{sizeField: size},
+	})
+}
+
+func sprocket(name string) *unstructured.Unstructured {
+	return newItem("sprocket.example.com/v1", "Sprocket", name, map[string]any{
+		specField: map[string]any{"teeth": int64(12)},
+	})
+}
+
+func cog(name string) *unstructured.Unstructured {
+	return newItem("cog.example.com/v1", "Cog", name, map[string]any{
+		specField: map[string]any{"teeth": int64(8)},
+	})
+}
+
+// localSubjectAccessReview returns an object of a kind that can be created but never read or
+// listed.
+func localSubjectAccessReview(name string) *unstructured.Unstructured {
+	return newItem("authorization.k8s.io/v1", "LocalSubjectAccessReview", name, map[string]any{
+		specField: map[string]any{
+			"user":               "alice",
+			"resourceAttributes": map[string]any{"verb": "get", "resource": "pods"},
+		},
+	})
+}
+
+// limitRange returns an object of a built-in kind that no other spec uses, so its drift watch is
+// added by the spec that uses it.
+func limitRange(name string) *unstructured.Unstructured {
+	return newItem("v1", "LimitRange", name, map[string]any{
+		specField: map[string]any{
+			"limits": []any{map[string]any{"type": "Container", "max": map[string]any{"cpu": "1"}}},
+		},
+	})
+}
+
+func service(name string) *unstructured.Unstructured {
+	return newItem("v1", "Service", name, map[string]any{
+		specField: map[string]any{
+			"selector": map[string]any{"app": name},
+			"ports":    []any{map[string]any{"port": int64(80)}},
+		},
+	})
+}
+
 func withNamespace(obj *unstructured.Unstructured, namespace string) *unstructured.Unstructured {
 	obj.SetNamespace(namespace)
 	return obj
 }
 
-// widgetCRD and gadgetCRD return a new object on every call, because installing a CRD changes
-// the object passed in.
+// widgetCRD, gadgetCRD, gizmoCRD, sprocketCRD and cogCRD return a new object on every call,
+// because installing a CRD changes the object passed in. Each test CRD is installed by one spec
+// only.
 func widgetCRD() *apiextensionsv1.CustomResourceDefinition {
 	return testCRD("widget.example.com", "Widget", "widgets")
 }
 
 func gadgetCRD() *apiextensionsv1.CustomResourceDefinition {
 	return testCRD("gadget.example.com", "Gadget", "gadgets")
+}
+
+func gizmoCRD() *apiextensionsv1.CustomResourceDefinition {
+	return testCRD("gizmo.example.com", "Gizmo", "gizmos")
+}
+
+func sprocketCRD() *apiextensionsv1.CustomResourceDefinition {
+	return testCRD("sprocket.example.com", "Sprocket", "sprockets")
+}
+
+func cogCRD() *apiextensionsv1.CustomResourceDefinition {
+	return testCRD("cog.example.com", "Cog", "cogs")
 }
 
 func testCRD(group, kind, plural string) *apiextensionsv1.CustomResourceDefinition {
@@ -325,6 +391,39 @@ func liveLabels(ns *corev1.Namespace, obj *unstructured.Unstructured) func(g Gom
 	}
 }
 
+// liveSize returns spec.size of the live object (Widget, Gizmo).
+func liveSize(ns *corev1.Namespace, obj *unstructured.Unstructured) func(g Gomega) int64 {
+	return func(g Gomega) int64 {
+		size, _, err := unstructured.NestedInt64(liveObject(ns, obj)(g).Object, specField, sizeField)
+		g.Expect(err).NotTo(HaveOccurred())
+		return size
+	}
+}
+
+// otherManager is the field manager of the changes that specs make in place of a user.
+const otherManager = "test-user"
+
+// patchAsUser changes the live object with a merge patch sent by otherManager. obj must be the
+// live object; it is updated in place, including its new resourceVersion.
+func patchAsUser(obj *unstructured.Unstructured, change func(*unstructured.Unstructured)) {
+	GinkgoHelper()
+	orig := obj.DeepCopy()
+	change(obj)
+	Expect(k8sClient.Patch(ctx, obj, client.MergeFrom(orig), client.FieldOwner(otherManager))).To(Succeed())
+}
+
+// resourceVersions returns the live resourceVersions of the namespace and of the objects in it,
+// keyed by kind and name.
+func resourceVersions(ns *corev1.Namespace, objs ...*unstructured.Unstructured) func(g Gomega) map[string]string {
+	return func(g Gomega) map[string]string {
+		versions := map[string]string{"Namespace": namespaceVersion(ns)(g)}
+		for _, obj := range objs {
+			versions[obj.GetKind()+"/"+obj.GetName()] = liveObject(ns, obj)(g).GetResourceVersion()
+		}
+		return versions
+	}
+}
+
 // ownedBy matches the owner reference the controller sets: the class, marked as controller.
 func ownedBy(class *v1alpha1.NamespaceClass) gomegatypes.GomegaMatcher {
 	return SatisfyAll(
@@ -397,4 +496,39 @@ func expectEvent(obj client.Object, eventType, reason, noteSubstr string) events
 	var found []eventsv1.Event
 	Eventually(eventsAbout(obj)).Should(ContainElement(eventWith(eventType, reason, noteSubstr), &found))
 	return found[0]
+}
+
+// requeueAfterCount returns how many runs of the controller have asked to run again after a delay
+// (controller_runtime_reconcile_total with result requeue_after), over all namespaces.
+func requeueAfterCount(g Gomega) float64 {
+	families, err := metrics.Registry.Gather()
+	g.Expect(err).NotTo(HaveOccurred())
+	for _, family := range families {
+		if family.GetName() != "controller_runtime_reconcile_total" {
+			continue
+		}
+		for _, metric := range family.GetMetric() {
+			labels := map[string]string{}
+			for _, label := range metric.GetLabel() {
+				labels[label.GetName()] = label.GetValue()
+			}
+			if labels["controller"] == "namespaceclass" && labels["result"] == "requeue_after" {
+				return metric.GetCounter().GetValue()
+			}
+		}
+	}
+	return 0
+}
+
+// settledRequeueCount waits until no run has asked to run again for longer than the one-second
+// delay, and returns requeueAfterCount.
+func settledRequeueCount() float64 {
+	GinkgoHelper()
+	last := -1.0
+	Eventually(func(g Gomega) {
+		previous := last
+		last = requeueAfterCount(g)
+		g.Expect(last).To(Equal(previous))
+	}).WithPolling(1500 * time.Millisecond).Should(Succeed())
+	return last
 }

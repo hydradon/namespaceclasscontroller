@@ -2,20 +2,26 @@ package controller
 
 import (
 	"context"
+	"fmt"
+	"maps"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/rest"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/config"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllertest"
 	"sigs.k8s.io/controller-runtime/pkg/envtest"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
@@ -102,6 +108,10 @@ func startManager() (stop func()) {
 		Recorder:  mgr.GetEventRecorder("namespaceclass-controller"),
 	}
 	Expect(reconciler.SetupWithManager(mgr)).To(Succeed())
+	reconciler.watches.gracePeriod = testWatchGracePeriod
+	driftWatches = reconciler.watches
+	driftCache = &gatedCache{Cache: reconciler.watches.cache, held: map[schema.GroupKind]*controllertest.FakeInformer{}}
+	reconciler.watches.cache = driftCache
 
 	mgrCtx, cancelMgr := context.WithCancel(ctx)
 	done := make(chan struct{})
@@ -116,6 +126,74 @@ func startManager() (stop func()) {
 		cancelMgr()
 		Eventually(done).Should(BeClosed())
 	}
+}
+
+// testWatchGracePeriod replaces the 30-second grace period for drift watches, so that specs can
+// wait for it.
+const testWatchGracePeriod = 5 * time.Second
+
+// The drift watches of the running manager. Specs read the registry to wait until the watches are
+// ready, and use the cache to hold back the watch of a kind.
+var (
+	driftWatches *watchRegistry
+	driftCache   *gatedCache
+)
+
+// driftWatchStates returns the state of the drift watch of each kind.
+func driftWatchStates() map[schema.GroupKind]watchState {
+	driftWatches.mu.Lock()
+	defer driftWatches.mu.Unlock()
+	return maps.Clone(driftWatches.watched)
+}
+
+// expectDriftWatchesReady waits until the drift watch of each object's kind has listed its objects,
+// and then until no run is waiting to run again. Until then, a run that repeats every second can
+// undo a change to a managed object even when the watch reports nothing, so specs that test the
+// watches call this before they change an object. A watch that timed out fails the spec: it may
+// never report the change.
+func expectDriftWatchesReady(objs ...*unstructured.Unstructured) {
+	GinkgoHelper()
+	Expect(objs).NotTo(BeEmpty())
+	for _, obj := range objs {
+		gk := obj.GroupVersionKind().GroupKind()
+		Eventually(func(g Gomega) {
+			state := driftWatchStates()[gk]
+			if state == watchTimedOut {
+				StopTrying(fmt.Sprintf("the drift watch of %s did not list its objects within the grace period", gk)).Now()
+			}
+			g.Expect(state).To(Equal(watchSynced), "the drift watch of %s has not listed its objects", gk)
+		}).Should(Succeed())
+	}
+	settledRequeueCount()
+}
+
+// gatedCache is the drift cache, with a way to hold back the watch of a kind. A watch that is held
+// back gets a fake informer, which reports no change and has not listed the objects until release
+// is called.
+type gatedCache struct {
+	cache.Cache
+
+	mu   sync.Mutex
+	held map[schema.GroupKind]*controllertest.FakeInformer
+}
+
+// holdBack must be called before the first watch of the kind is added.
+func (c *gatedCache) holdBack(gk schema.GroupKind) (release func()) {
+	informer := controllertest.NewFakeInformer()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.held[gk] = informer
+	return sync.OnceFunc(informer.Synced)
+}
+
+func (c *gatedCache) GetInformer(ctx context.Context, obj client.Object, opts ...cache.InformerGetOption) (cache.Informer, error) {
+	c.mu.Lock()
+	informer := c.held[obj.GetObjectKind().GroupVersionKind().GroupKind()]
+	c.mu.Unlock()
+	if informer != nil {
+		return informer, nil
+	}
+	return c.Cache.GetInformer(ctx, obj, opts...)
 }
 
 // getFirstFoundEnvTestBinaryDir locates the first binary in the specified path.

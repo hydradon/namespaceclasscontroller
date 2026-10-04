@@ -107,7 +107,7 @@ var _ = Describe("Namespace controller", func() {
 		labels := before.GetLabels()
 		labels["team"] = "platform"
 		before.SetLabels(labels)
-		Expect(k8sClient.Patch(ctx, before, client.MergeFrom(orig), client.FieldOwner("test-user"))).To(Succeed())
+		Expect(k8sClient.Patch(ctx, before, client.MergeFrom(orig), client.FieldOwner(otherManager))).To(Succeed())
 
 		By("switching to class B")
 		setClassLabel(ns, classB.Name)
@@ -264,6 +264,7 @@ var _ = Describe("Namespace controller", func() {
 		Expect(k8sClient.Create(ctx, users)).To(Succeed())
 
 		By("switching to class B, which also defines settings")
+		expectDriftWatchesReady(onlyA) // the deletion of only-a below must start a run
 		setClassLabel(ns, classB.Name)
 		expectCreated(ns, onlyB)
 		expectDeleted(ns, onlyA)
@@ -280,11 +281,19 @@ var _ = Describe("Namespace controller", func() {
 		By("not retrying: no annotation write, no change to the user's object, no new or repeated event")
 		expectEvent(ns, corev1.EventTypeNormal, ReasonCreated, "ConfigMap/only-b")
 		expectEvent(ns, corev1.EventTypeNormal, ReasonDeleted, "ConfigMap/only-a")
+		// The annotation checked above was the last write of the switch.
+		version := namespaceVersion(ns)(Default)
+		// Deleting only-a starts one more run (drift correction). That run finds the conflict
+		// again at the final version of the namespace, so its Conflict event is a new event.
+		conflictAtVersion := SatisfyAll(
+			eventWith(corev1.EventTypeWarning, ReasonConflict, "ConfigMap/settings"),
+			HaveField("Regarding.ResourceVersion", version),
+		)
+		Eventually(eventsAbout(ns)).Should(ContainElement(conflictAtVersion))
 		events := settledEvents(ns)
 		// Another run with an unchanged namespace would repeat the Conflict event, and a repeated
 		// event gets a series right away.
 		Expect(events).To(HaveEach(BeZero()), "an event about the namespace was recorded twice")
-		version := namespaceVersion(ns)(Default)
 		Consistently(func(g Gomega) {
 			g.Expect(namespaceVersion(ns)(g)).To(Equal(version))
 			g.Expect(liveObject(ns, settings)(g).GetResourceVersion()).To(Equal(users.ResourceVersion))
@@ -293,11 +302,10 @@ var _ = Describe("Namespace controller", func() {
 
 		By("writing nothing in a later run while the conflict lasts")
 		updateClass(classB, onlyB, settings) // the same objects in a new order: a new generation, so a new run
-		// The Conflict event of the first run names an older version of the namespace, so this
-		// event comes from the new run.
+		// The new run repeats the Conflict event of the run above, so that event gets a series.
 		Eventually(eventsAbout(ns)).Should(ContainElement(SatisfyAll(
-			eventWith(corev1.EventTypeWarning, ReasonConflict, "ConfigMap/settings"),
-			HaveField("Regarding.ResourceVersion", version),
+			conflictAtVersion,
+			HaveField("Series.Count", BeEquivalentTo(2)),
 		)))
 		Consistently(namespaceVersion(ns)).Should(Equal(version))
 
@@ -404,11 +412,7 @@ var _ = Describe("Namespace controller", func() {
 		expectAnnotation(ns, w1)
 
 		updateClass(class, widget("w1", 5))
-		Eventually(func(g Gomega) int64 {
-			size, _, err := unstructured.NestedInt64(liveObject(ns, w1)(g).Object, specField, "size")
-			g.Expect(err).NotTo(HaveOccurred())
-			return size
-		}).Should(Equal(int64(5)))
+		Eventually(liveSize(ns, w1)).Should(Equal(int64(5)))
 		expectEvent(ns, corev1.EventTypeNormal, ReasonUpdated, "Widget.widget.example.com/w1")
 
 		updateClass(class)

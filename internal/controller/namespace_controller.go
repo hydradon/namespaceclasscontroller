@@ -12,6 +12,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/tools/events"
 	"k8s.io/client-go/util/workqueue"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -38,6 +39,8 @@ type NamespaceReconciler struct {
 	client.Client                      // cached reads of NamespaceClasses and the Namespace list; all writes
 	APIReader     client.Reader        // live reads: the Namespace being reconciled and managed objects
 	Recorder      events.EventRecorder // events about Namespaces and NamespaceClasses
+
+	watches *watchRegistry // drift watches on the created objects; set by SetupWithManager
 }
 
 // +kubebuilder:rbac:groups=*,resources=*,verbs=*
@@ -70,6 +73,16 @@ func (r *NamespaceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 	if !proceed {
 		return ctrl.Result{}, err
 	}
+	// The watch for a kind is added before its objects are read. Once the watch is ready, an edit
+	// or deletion of an object starts a new run; until then, the run is repeated (see the end).
+	watchesReady := true
+	for _, obj := range desired {
+		ready, err := r.watches.ensure(ctx, obj.GroupVersionKind())
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+		watchesReady = watchesReady && ready
+	}
 
 	want := inventory.RefsOf(desired)
 	items, conflicts, failed := r.inspect(ctx, ns, desired)
@@ -93,7 +106,17 @@ func (r *NamespaceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 	if err := r.recordIfChanged(ctx, ns, owned.Union(keep)); err != nil {
 		return ctrl.Result{}, errors.Join(pruneErr, err)
 	}
-	return ctrl.Result{}, pruneErr
+	if pruneErr != nil {
+		return ctrl.Result{}, pruneErr
+	}
+	if !watchesReady {
+		// A watch that has not listed its objects yet reports no change, so the run is repeated
+		// until it has. A watch that can never list them (a create-only kind, a missing CRD, an
+		// aggregated API that is down) counts as ready after the grace period, so this adds about
+		// one run per second for each such namespace, for at most the grace period.
+		return ctrl.Result{RequeueAfter: time.Second}, nil
+	}
+	return ctrl.Result{}, nil
 }
 
 // desiredObjects returns the objects the Namespace should have. proceed is false when the run must
@@ -142,15 +165,28 @@ func (r *NamespaceReconciler) desiredObjects(ctx context.Context, ns *corev1.Nam
 	return desired, true, nil
 }
 
-// SetupWithManager sets up the controller with the Manager.
+// SetupWithManager sets up the controller with the Manager. The drift watches on created objects
+// are added later, by Reconcile, the first time a class uses a kind.
 func (r *NamespaceReconciler) SetupWithManager(mgr ctrl.Manager) error {
-	return ctrl.NewControllerManagedBy(mgr).
+	managedCache, err := newManagedCache(mgr)
+	if err != nil {
+		return err
+	}
+	if err := mgr.Add(managedCache); err != nil {
+		return err
+	}
+	c, err := ctrl.NewControllerManagedBy(mgr).
 		Named("namespaceclass").
 		For(&corev1.Namespace{}, builder.WithPredicates(namespacePredicate())).
 		Watches(&v1alpha1.NamespaceClass{}, handler.EnqueueRequestsFromMapFunc(r.namespacesForClass),
 			builder.WithPredicates(predicate.GenerationChangedPredicate{})).
 		WithOptions(controller.Options{RateLimiter: rateLimiter()}).
-		Complete(r)
+		Build(r)
+	if err != nil {
+		return err
+	}
+	r.watches = &watchRegistry{ctrl: c, cache: managedCache, watched: map[schema.GroupKind]watchState{}}
+	return nil
 }
 
 // rateLimiter is the controller-runtime default rate limiter, with the retry backoff of one
