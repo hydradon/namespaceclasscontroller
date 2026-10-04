@@ -1,323 +1,356 @@
 //go:build e2e
-// +build e2e
 
 package e2e
 
 import (
-	"encoding/json"
 	"fmt"
-	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
+	"strings"
 	"time"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 
+	"github.com/hydradon/namespaceclasscontroller/api/v1alpha1"
 	"github.com/hydradon/namespaceclasscontroller/test/utils"
 )
 
-// namespace where the project is deployed in
-const namespace = "namespaceclass-system"
+const (
+	// managerNamespace is the namespace the controller is deployed in.
+	managerNamespace = "namespaceclass-system"
+	// classCRD is the name of the NamespaceClass CustomResourceDefinition.
+	classCRD = "namespaceclasses.namespaceclass.akuity.io"
 
-// serviceAccountName created for the project
-const serviceAccountName = "namespaceclass-controller-manager"
+	publicNetwork   = "public-network"
+	internalNetwork = "internal-network"
+	teamBaseline    = "team-baseline"
 
-// metricsServiceName is the name of the metrics service of the project
-const metricsServiceName = "namespaceclass-controller-manager-metrics-service"
+	webPortal = "web-portal"
+	billing   = "billing"
+	teamA     = "team-a"
+	legacy    = "legacy"
 
-// metricsRoleBindingName is the name of the RBAC that will be created to allow get the metrics data
-const metricsRoleBindingName = "namespaceclass-metrics-binding"
+	// The sample classes and namespaces that the specs apply, in config/samples.
+	publicNetworkSample   = "namespaceclass_v1alpha1_public-network.yaml"
+	internalNetworkSample = "namespaceclass_v1alpha1_internal-network.yaml"
+	teamBaselineSample    = "namespaceclass_v1alpha1_team-baseline.yaml"
+	webPortalSample       = "namespace_web-portal.yaml"
+	billingSample         = "namespace_billing.yaml"
+	teamASample           = "namespace_team-a.yaml"
 
-var _ = Describe("Manager", Ordered, func() {
-	var controllerPodName string
+	// Paths that kubectl reads from an object.
+	uidPath     = "{.metadata.uid}"
+	ownersPath  = "{.metadata.ownerReferences}"
+	vpnCIDRPath = "{.spec.ingress[0].from[0].ipBlock.cidr}"
 
-	// Before running the tests, set up the environment by creating the namespace,
-	// enforce the restricted security policy to the namespace, installing CRDs,
-	// and deploying the controller.
+	// legacyConfigMap is made by hand and has the name of an object that internal-network creates.
+	legacyConfigMap = `apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: network-info
+  namespace: legacy
+data:
+  owner: me
+`
+)
+
+// The kubectl resource names that the specs list in a namespace, and the objects that the sample
+// classes create, written as Kind/name.
+var (
+	networkResources = []string{"networkpolicy", "configmap"}
+	teamResources    = []string{"serviceaccount", "resourcequota", "limitrange", "rolebinding"}
+
+	publicObjects     = []string{"NetworkPolicy/ingress"}
+	internalObjects   = []string{"NetworkPolicy/ingress", "NetworkPolicy/egress", "ConfigMap/network-info"}
+	internalV2Objects = append(slices.Clone(internalObjects), "NetworkPolicy/allow-monitoring")
+	teamObjects       = []string{
+		"ServiceAccount/deployer", "ResourceQuota/compute", "LimitRange/defaults", "RoleBinding/deployer-view",
+	}
+)
+
+var _ = Describe("NamespaceClass controller", Ordered, func() {
+	// Before running the tests, set up the environment by creating the namespace, enforcing the
+	// restricted security policy on it, installing the CRD, and deploying the controller.
 	BeforeAll(func() {
-		By("creating manager namespace")
-		cmd := exec.Command("kubectl", "create", "ns", namespace)
-		_, err := utils.Run(cmd)
+		By("creating the manager namespace")
+		_, err := utils.Kubectl("create", "ns", managerNamespace)
 		Expect(err).NotTo(HaveOccurred(), "Failed to create namespace")
 
 		By("labeling the namespace to enforce the restricted security policy")
-		cmd = exec.Command("kubectl", "label", "--overwrite", "ns", namespace,
+		_, err = utils.Kubectl("label", "--overwrite", "ns", managerNamespace,
 			"pod-security.kubernetes.io/enforce=restricted")
-		_, err = utils.Run(cmd)
 		Expect(err).NotTo(HaveOccurred(), "Failed to label namespace with restricted policy")
 
 		By("installing CRDs")
-		cmd = exec.Command("make", "install")
-		_, err = utils.Run(cmd)
+		_, err = utils.Run(exec.Command("make", "install"))
 		Expect(err).NotTo(HaveOccurred(), "Failed to install CRDs")
 
 		By("deploying the controller-manager")
-		cmd = exec.Command("make", "deploy", fmt.Sprintf("IMG=%s", managerImage))
-		_, err = utils.Run(cmd)
+		_, err = utils.Run(exec.Command("make", "deploy", "IMG="+managerImage))
 		Expect(err).NotTo(HaveOccurred(), "Failed to deploy the controller-manager")
 	})
 
-	// After all tests have been executed, clean up by undeploying the controller, uninstalling CRDs,
-	// and deleting the namespace.
+	// After all tests have been executed, clean up by deleting the sample namespaces, undeploying
+	// the controller, uninstalling the CRD, and deleting the manager namespace.
 	AfterAll(func() {
-		By("cleaning up the curl pod for metrics")
-		cmd := exec.Command("kubectl", "delete", "pod", "curl-metrics", "-n", namespace)
-		_, _ = utils.Run(cmd)
+		By("deleting the sample namespaces")
+		_, _ = utils.Kubectl("delete", "ns", webPortal, billing, teamA, legacy, "--ignore-not-found")
 
 		By("undeploying the controller-manager")
-		cmd = exec.Command("make", "undeploy")
-		_, _ = utils.Run(cmd)
+		_, _ = utils.Run(exec.Command("make", "undeploy"))
 
 		By("uninstalling CRDs")
-		cmd = exec.Command("make", "uninstall")
-		_, _ = utils.Run(cmd)
+		_, _ = utils.Run(exec.Command("make", "uninstall"))
 
 		By("removing manager namespace")
-		cmd = exec.Command("kubectl", "delete", "ns", namespace)
-		_, _ = utils.Run(cmd)
+		_, _ = utils.Kubectl("delete", "ns", managerNamespace, "--ignore-not-found")
 	})
 
-	// After each test, check for failures and collect logs, events,
-	// and pod descriptions for debugging.
+	// After each test, check for failures and collect logs, events, and pod descriptions for debugging.
 	AfterEach(func() {
-		specReport := CurrentSpecReport()
-		if specReport.Failed() {
-			By("Fetching controller manager pod logs")
-			cmd := exec.Command("kubectl", "logs", controllerPodName, "-n", namespace)
-			controllerLogs, err := utils.Run(cmd)
-			if err == nil {
-				_, _ = fmt.Fprintf(GinkgoWriter, "Controller logs:\n %s", controllerLogs)
-			} else {
-				_, _ = fmt.Fprintf(GinkgoWriter, "Failed to get Controller logs: %s", err)
-			}
-
-			By("Fetching Kubernetes events")
-			cmd = exec.Command("kubectl", "get", "events", "-n", namespace, "--sort-by=.lastTimestamp")
-			eventsOutput, err := utils.Run(cmd)
-			if err == nil {
-				_, _ = fmt.Fprintf(GinkgoWriter, "Kubernetes events:\n%s", eventsOutput)
-			} else {
-				_, _ = fmt.Fprintf(GinkgoWriter, "Failed to get Kubernetes events: %s", err)
-			}
-
-			By("Fetching curl-metrics logs")
-			cmd = exec.Command("kubectl", "logs", "curl-metrics", "-n", namespace)
-			metricsOutput, err := utils.Run(cmd)
-			if err == nil {
-				_, _ = fmt.Fprintf(GinkgoWriter, "Metrics logs:\n %s", metricsOutput)
-			} else {
-				_, _ = fmt.Fprintf(GinkgoWriter, "Failed to get curl-metrics logs: %s", err)
-			}
-
-			By("Fetching controller manager pod description")
-			cmd = exec.Command("kubectl", "describe", "pod", controllerPodName, "-n", namespace)
-			podDescription, err := utils.Run(cmd)
-			if err == nil {
-				fmt.Println("Pod description:\n", podDescription)
-			} else {
-				fmt.Println("Failed to describe controller pod")
-			}
+		if !CurrentSpecReport().Failed() {
+			return
 		}
+		printKubectl("controller logs", "logs", "-l", "control-plane=controller-manager", "-n", managerNamespace)
+		printKubectl("Kubernetes events", "get", "events", "-A", "--sort-by=.lastTimestamp")
+		printKubectl("controller pod description", "describe", "pod", "-l", "control-plane=controller-manager",
+			"-n", managerNamespace)
 	})
 
 	SetDefaultEventuallyTimeout(2 * time.Minute)
 	SetDefaultEventuallyPollingInterval(time.Second)
 
-	Context("Manager", func() {
-		It("should run successfully", func() {
-			By("validating that the controller-manager pod is running as expected")
-			verifyControllerUp := func(g Gomega) {
-				By("getting the name of the controller-manager pod")
-				cmd := exec.Command("kubectl", "get",
-					"pods", "-l", "control-plane=controller-manager",
-					"-o", "go-template={{ range .items }}"+
-						"{{ if not .metadata.deletionTimestamp }}"+
-						"{{ .metadata.name }}"+
-						"{{ \"\\n\" }}{{ end }}{{ end }}",
-					"-n", namespace,
-				)
+	It("runs the controller pod", func() {
+		Eventually(func(g Gomega) {
+			phases, err := controllerPodField("{.items[*].status.phase}")
+			g.Expect(err).NotTo(HaveOccurred(), "Failed to retrieve controller-manager pod information")
+			g.Expect(strings.Fields(phases)).To(ConsistOf("Running"), "expected one controller pod, running")
 
-				podOutput, err := utils.Run(cmd)
-				g.Expect(err).NotTo(HaveOccurred(), "Failed to retrieve controller-manager pod information")
-				podNames := utils.GetNonEmptyLines(podOutput)
-				g.Expect(podNames).To(HaveLen(1), "expected 1 controller pod running")
-				controllerPodName = podNames[0]
-				g.Expect(controllerPodName).To(ContainSubstring("controller-manager"))
+			ready, err := controllerPodField(`{.items[*].status.conditions[?(@.type=="Ready")].status}`)
+			g.Expect(err).NotTo(HaveOccurred())
+			g.Expect(ready).To(Equal("True"), "controller pod not ready")
+		}).Should(Succeed())
+	})
 
-				By("validating the pod's status")
-				cmd = exec.Command("kubectl", "get",
-					"pods", controllerPodName, "-o", "jsonpath={.status.phase}",
-					"-n", namespace,
-				)
-				output, err := utils.Run(cmd)
-				g.Expect(err).NotTo(HaveOccurred())
-				g.Expect(output).To(Equal("Running"), "Incorrect controller-manager pod status")
-			}
-			Eventually(verifyControllerUp).Should(Succeed())
-		})
+	It("creates the objects of a class in a namespace that uses it", func() {
+		By("waiting for the CRD to be established")
+		_, err := utils.Kubectl("wait", "--for=condition=Established", "crd/"+classCRD, "--timeout=60s")
+		Expect(err).NotTo(HaveOccurred())
 
-		It("should ensure the metrics endpoint is serving metrics", func() {
-			By("creating a ClusterRoleBinding for the service account to allow access to metrics")
-			cmd := exec.Command("kubectl", "create", "clusterrolebinding", metricsRoleBindingName,
-				"--clusterrole=namespaceclass-metrics-reader",
-				fmt.Sprintf("--serviceaccount=%s:%s", namespace, serviceAccountName),
-			)
-			_, err := utils.Run(cmd)
-			Expect(err).NotTo(HaveOccurred(), "Failed to create ClusterRoleBinding")
-
-			By("validating that the metrics service is available")
-			cmd = exec.Command("kubectl", "get", "service", metricsServiceName, "-n", namespace)
-			_, err = utils.Run(cmd)
-			Expect(err).NotTo(HaveOccurred(), "Metrics service should exist")
-
-			By("getting the service account token")
-			token, err := serviceAccountToken()
+		By("applying the sample classes and namespaces")
+		for _, file := range []string{
+			publicNetworkSample, internalNetworkSample, teamBaselineSample,
+			webPortalSample, billingSample, teamASample,
+		} {
+			_, err := utils.Kubectl("apply", "-f", filepath.Join("config", "samples", file))
 			Expect(err).NotTo(HaveOccurred())
-			Expect(token).NotTo(BeEmpty())
+		}
 
-			By("ensuring the controller pod is ready")
-			verifyControllerPodReady := func(g Gomega) {
-				cmd := exec.Command("kubectl", "get", "pod", controllerPodName, "-n", namespace,
-					"-o", "jsonpath={.status.conditions[?(@.type=='Ready')].status}")
-				output, err := utils.Run(cmd)
-				g.Expect(err).NotTo(HaveOccurred())
-				g.Expect(output).To(Equal("True"), "Controller pod not ready")
-			}
-			Eventually(verifyControllerPodReady, 3*time.Minute, time.Second).Should(Succeed())
+		By("waiting for the NetworkPolicy of web-portal")
+		Eventually(managedObjects(webPortal, networkResources...)).Should(ConsistOf(publicObjects))
+		ingress := "networkpolicy/ingress"
+		Expect(field(ingress, webPortal, vpnCIDRPath)(Default)).To(Equal("0.0.0.0/0"))
 
-			By("verifying that the controller manager is serving the metrics server")
-			verifyMetricsServerStarted := func(g Gomega) {
-				cmd := exec.Command("kubectl", "logs", controllerPodName, "-n", namespace)
-				output, err := utils.Run(cmd)
-				g.Expect(err).NotTo(HaveOccurred())
-				g.Expect(output).To(ContainSubstring("Serving metrics server"),
-					"Metrics server not yet started")
-			}
-			Eventually(verifyMetricsServerStarted, 3*time.Minute, time.Second).Should(Succeed())
+		By("checking that the object is marked as created by the class")
+		Expect(field(ingress, webPortal, labelPath(v1alpha1.ManagedByClassLabel))(Default)).To(Equal(publicNetwork))
+		owner := "{range .metadata.ownerReferences[*]}{.kind}/{.name}/{.controller}{end}"
+		Expect(field(ingress, webPortal, owner)(Default)).To(Equal("NamespaceClass/" + publicNetwork + "/true"))
 
-			// +kubebuilder:scaffold:e2e-metrics-webhooks-readiness
+		By("checking that the namespace lists the object")
+		recorded := field("namespace/"+webPortal, "", annotationPath(v1alpha1.ManagedResourcesAnnotation))
+		Expect(recorded(Default)).To(MatchJSON(`[{"group":"networking.k8s.io","kind":"NetworkPolicy","name":"ingress"}]`))
+	})
 
-			By("creating the curl-metrics pod to access the metrics endpoint")
-			cmd = exec.Command("kubectl", "run", "curl-metrics", "--restart=Never",
-				"--namespace", namespace,
-				"--image=curlimages/curl:latest",
-				"--overrides",
-				fmt.Sprintf(`{
-					"spec": {
-						"containers": [{
-							"name": "curl",
-							"image": "curlimages/curl:latest",
-							"command": ["/bin/sh", "-c"],
-							"args": [
-								"for i in $(seq 1 30); do curl -v -k -H 'Authorization: Bearer %s' https://%s.%s.svc.cluster.local:8443/metrics && exit 0 || sleep 2; done; exit 1"
-							],
-							"securityContext": {
-								"readOnlyRootFilesystem": true,
-								"allowPrivilegeEscalation": false,
-								"capabilities": {
-									"drop": ["ALL"]
-								},
-								"runAsNonRoot": true,
-								"runAsUser": 1000,
-								"seccompProfile": {
-									"type": "RuntimeDefault"
-								}
-							}
-						}],
-						"serviceAccountName": "%s"
-					}
-				}`, token, metricsServiceName, namespace, serviceAccountName))
-			_, err = utils.Run(cmd)
-			Expect(err).NotTo(HaveOccurred(), "Failed to create curl-metrics pod")
+	It("lists the events of a namespace", func() {
+		Eventually(func(g Gomega) {
+			events, err := utils.Kubectl(eventsOf(webPortal)...)
+			g.Expect(err).NotTo(HaveOccurred())
+			g.Expect(events).To(ContainSubstring("Created"))
+			g.Expect(events).To(ContainSubstring("created NetworkPolicy.networking.k8s.io/ingress"))
+			_, _ = fmt.Fprintf(GinkgoWriter, "events of %s:\n%s\n", webPortal, events)
+		}).Should(Succeed())
+	})
 
-			By("waiting for the curl-metrics pod to complete.")
-			verifyCurlUp := func(g Gomega) {
-				cmd := exec.Command("kubectl", "get", "pods", "curl-metrics",
-					"-o", "jsonpath={.status.phase}",
-					"-n", namespace)
-				output, err := utils.Run(cmd)
-				g.Expect(err).NotTo(HaveOccurred())
-				g.Expect(output).To(Equal("Succeeded"), "curl pod in wrong status")
-			}
-			Eventually(verifyCurlUp, 5*time.Minute).Should(Succeed())
+	It("switches a namespace to another class and keeps the objects that both classes define", func() {
+		ingress := "networkpolicy/ingress"
+		ingressUID := field(ingress, webPortal, uidPath)(Default)
 
-			By("getting the metrics by checking curl-metrics logs")
-			verifyMetricsAvailable := func(g Gomega) {
-				metricsOutput, err := getMetricsOutput()
-				g.Expect(err).NotTo(HaveOccurred(), "Failed to retrieve logs from curl pod")
-				g.Expect(metricsOutput).NotTo(BeEmpty())
-				g.Expect(metricsOutput).To(ContainSubstring("< HTTP/1.1 200 OK"))
-			}
-			Eventually(verifyMetricsAvailable, 2*time.Minute).Should(Succeed())
-		})
+		_, err := utils.Kubectl("label", "ns", webPortal, v1alpha1.ClassLabel+"="+internalNetwork, "--overwrite")
+		Expect(err).NotTo(HaveOccurred())
 
-		// +kubebuilder:scaffold:e2e-webhooks-checks
+		Eventually(field(ingress, webPortal, vpnCIDRPath)).Should(Equal("10.8.0.0/16"))
+		Eventually(managedObjects(webPortal, networkResources...)).Should(ConsistOf(internalObjects))
+		Expect(field(ingress, webPortal, uidPath)(Default)).To(Equal(ingressUID),
+			"the object that both classes define must be updated in place, not re-created")
+		Expect(field(ingress, webPortal, "{.metadata.ownerReferences[*].name}")(Default)).To(Equal(internalNetwork))
+	})
 
-		// TODO: Customize the e2e test suite with scenarios specific to your project.
-		// Consider applying sample/CR(s) and check their status and/or verifying
-		// the reconciliation by using the metrics, i.e.:
-		// metricsOutput, err := getMetricsOutput()
-		// Expect(err).NotTo(HaveOccurred(), "Failed to retrieve logs from curl pod")
-		// Expect(metricsOutput).To(ContainSubstring(
-		//    fmt.Sprintf(`controller_runtime_reconcile_total{controller="%s",result="success"} 1`,
-		//    strings.ToLower(<Kind>),
-		// ))
+	It("applies the edits of a class to every namespace that uses it", func() {
+		By("applying a class with a new VPN range and one more policy")
+		_, err := utils.Kubectl("apply", "-f", filepath.Join("docs", "demo", "internal-network-v2.yaml"))
+		Expect(err).NotTo(HaveOccurred())
+		for _, ns := range []string{webPortal, billing} {
+			Eventually(field("networkpolicy/ingress", ns, vpnCIDRPath)).Should(Equal("10.9.0.0/16"))
+			Eventually(field("configmap/network-info", ns, "{.data.vpnCIDR}")).Should(Equal("10.9.0.0/16"))
+			Eventually(managedObjects(ns, networkResources...)).Should(ConsistOf(internalV2Objects))
+		}
+
+		By("applying the original class again")
+		_, err = utils.Kubectl("apply", "-f", filepath.Join("config", "samples", internalNetworkSample))
+		Expect(err).NotTo(HaveOccurred())
+		for _, ns := range []string{webPortal, billing} {
+			Eventually(field("networkpolicy/ingress", ns, vpnCIDRPath)).Should(Equal("10.8.0.0/16"))
+			Eventually(managedObjects(ns, networkResources...)).Should(ConsistOf(internalObjects))
+		}
+	})
+
+	It("restores an object that is deleted or edited by hand", func() {
+		By("deleting a NetworkPolicy")
+		egressUID := field("networkpolicy/egress", webPortal, uidPath)(Default)
+		_, err := utils.Kubectl("delete", "networkpolicy", "egress", "-n", webPortal)
+		Expect(err).NotTo(HaveOccurred())
+		Eventually(field("networkpolicy/egress", webPortal, uidPath)).WithTimeout(30 * time.Second).
+			Should(And(Not(BeEmpty()), Not(Equal(egressUID))))
+
+		By("emptying the ingress rules of a NetworkPolicy")
+		out, err := utils.Kubectl("patch", "networkpolicy", "ingress", "-n", webPortal, "--type=merge",
+			"-p", `{"spec":{"ingress":[]}}`)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(out).NotTo(ContainSubstring("(no change)"))
+		Eventually(field("networkpolicy/ingress", webPortal, vpnCIDRPath)).WithTimeout(30 * time.Second).
+			Should(Equal("10.8.0.0/16"))
+	})
+
+	It("leaves an object it did not create alone, also when the namespace opts out", func() {
+		By("creating a namespace that has an object with a name the class wants")
+		_, err := utils.Kubectl("create", "ns", legacy)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(utils.KubectlApply(legacyConfigMap)).To(Succeed())
+
+		By("labeling the namespace with the class")
+		_, err = utils.Kubectl("label", "ns", legacy, v1alpha1.ClassLabel+"="+internalNetwork)
+		Expect(err).NotTo(HaveOccurred())
+		Eventually(managedObjects(legacy, networkResources...)).
+			Should(ConsistOf("NetworkPolicy/ingress", "NetworkPolicy/egress"))
+		Eventually(func(g Gomega) {
+			events, err := utils.Kubectl(eventsOf(legacy)...)
+			g.Expect(err).NotTo(HaveOccurred())
+			g.Expect(events).To(ContainSubstring("Conflict"))
+			g.Expect(events).To(ContainSubstring("ConfigMap/network-info already exists"))
+		}).Should(Succeed())
+		configMapData := field("configmap/network-info", legacy, "{.data}")
+		Expect(configMapData(Default)).To(MatchJSON(`{"owner":"me"}`))
+		recorded := field("namespace/"+legacy, "", annotationPath(v1alpha1.ManagedResourcesAnnotation))
+		Expect(recorded(Default)).To(MatchJSON(`[
+			{"group":"networking.k8s.io","kind":"NetworkPolicy","name":"egress"},
+			{"group":"networking.k8s.io","kind":"NetworkPolicy","name":"ingress"}
+		]`))
+
+		By("removing the label")
+		_, err = utils.Kubectl("label", "ns", legacy, v1alpha1.ClassLabel+"-")
+		Expect(err).NotTo(HaveOccurred())
+		Eventually(managedObjects(legacy, networkResources...)).Should(BeEmpty())
+		Expect(configMapData(Default)).To(MatchJSON(`{"owner":"me"}`))
+	})
+
+	It("creates objects of any kind", func() {
+		Eventually(managedObjects(teamA, teamResources...)).Should(ConsistOf(teamObjects))
+	})
+
+	It("deletes the objects with the real garbage collector when its class is deleted", func() {
+		deployer := "serviceaccount/deployer"
+
+		By("deleting the class with --cascade=orphan")
+		_, err := utils.Kubectl("delete", "nsclass", teamBaseline, "--cascade=orphan", "--timeout=2m")
+		Expect(err).NotTo(HaveOccurred())
+		Eventually(field(deployer, teamA, ownersPath)).Should(BeEmpty())
+		Consistently(managedObjects(teamA, teamResources...)).WithTimeout(10 * time.Second).
+			WithPolling(time.Second).Should(ConsistOf(teamObjects))
+
+		By("creating the class again")
+		_, err = utils.Kubectl("apply", "-f", filepath.Join("config", "samples", teamBaselineSample))
+		Expect(err).NotTo(HaveOccurred())
+		classUID := field("nsclass/"+teamBaseline, "", uidPath)(Default)
+		Expect(classUID).NotTo(BeEmpty())
+		Eventually(field(deployer, teamA, "{.metadata.ownerReferences[*].uid}")).Should(Equal(classUID))
+
+		By("deleting the class")
+		_, err = utils.Kubectl("delete", "nsclass", teamBaseline, "--timeout=2m")
+		Expect(err).NotTo(HaveOccurred())
+		Eventually(managedObjects(teamA, teamResources...)).Should(BeEmpty())
+	})
+
+	It("deletes the objects of a namespace when its label is removed", func() {
+		_, err := utils.Kubectl("label", "ns", webPortal, v1alpha1.ClassLabel+"-")
+		Expect(err).NotTo(HaveOccurred())
+
+		Eventually(managedObjects(webPortal, networkResources...)).Should(BeEmpty())
+		recorded := field("namespace/"+webPortal, "", annotationPath(v1alpha1.ManagedResourcesAnnotation))
+		Eventually(recorded).Should(BeEmpty())
 	})
 })
 
-// serviceAccountToken returns a token for the specified service account in the given namespace.
-// It uses the Kubernetes TokenRequest API to generate a token by directly sending a request
-// and parsing the resulting token from the API response.
-func serviceAccountToken() (string, error) {
-	const tokenRequestRawString = `{
-		"apiVersion": "authentication.k8s.io/v1",
-		"kind": "TokenRequest"
-	}`
+// eventsOf returns the kubectl arguments that list the events of a namespace. Events about a
+// cluster-scoped object such as a Namespace are stored in the default namespace.
+func eventsOf(namespace string) []string {
+	return []string{"events", "-n", "default", "--for", "namespace/" + namespace}
+}
 
-	By("creating temporary file to store the token request")
-	secretName := fmt.Sprintf("%s-token-request", serviceAccountName)
-	tokenRequestFile := filepath.Join("/tmp", secretName)
-	err := os.WriteFile(tokenRequestFile, []byte(tokenRequestRawString), os.FileMode(0o644))
+// controllerPodField reads a field of the controller pods with a kubectl JSONPath expression.
+func controllerPodField(jsonPath string) (string, error) {
+	return utils.Kubectl("get", "pods", "-l", "control-plane=controller-manager", "-n", managerNamespace,
+		"-o", "jsonpath="+jsonPath)
+}
+
+// field returns a function for Eventually that reads one field of an object with a kubectl JSONPath
+// expression. The resource is written like kubectl does, for example "networkpolicy/ingress". The
+// namespace is empty for a cluster-scoped object.
+func field(resource, namespace, jsonPath string) func(g Gomega) string {
+	return func(g Gomega) string {
+		args := []string{"get", resource, "-o", "jsonpath=" + jsonPath}
+		if namespace != "" {
+			args = append(args, "-n", namespace)
+		}
+		out, err := utils.Kubectl(args...)
+		g.Expect(err).NotTo(HaveOccurred())
+		return out
+	}
+}
+
+// managedObjects returns a function for Eventually that lists the objects of the given kinds that
+// the controller created in the namespace, written as Kind/name.
+func managedObjects(namespace string, resources ...string) func(g Gomega) []string {
+	return func(g Gomega) []string {
+		out, err := utils.Kubectl("get", strings.Join(resources, ","), "-n", namespace,
+			"-l", v1alpha1.ManagedByClassLabel,
+			"-o", `jsonpath={range .items[*]}{.kind}/{.metadata.name}{"\n"}{end}`)
+		g.Expect(err).NotTo(HaveOccurred())
+		return utils.GetNonEmptyLines(out)
+	}
+}
+
+func labelPath(key string) string {
+	return "{.metadata.labels." + escapeDots(key) + "}"
+}
+
+func annotationPath(key string) string {
+	return "{.metadata.annotations." + escapeDots(key) + "}"
+}
+
+// escapeDots makes a label or annotation key usable in a JSONPath expression.
+func escapeDots(key string) string {
+	return strings.ReplaceAll(key, ".", `\.`)
+}
+
+// printKubectl writes the output of a kubectl command to the test output, for debugging a failure.
+func printKubectl(title string, args ...string) {
+	By("fetching the " + title)
+	out, err := utils.Kubectl(args...)
 	if err != nil {
-		return "", err
+		_, _ = fmt.Fprintf(GinkgoWriter, "Failed to get the %s: %s\n", title, err)
+		return
 	}
-
-	var out string
-	verifyTokenCreation := func(g Gomega) {
-		By("executing kubectl command to create the token")
-		cmd := exec.Command("kubectl", "create", "--raw", fmt.Sprintf(
-			"/api/v1/namespaces/%s/serviceaccounts/%s/token",
-			namespace,
-			serviceAccountName,
-		), "-f", tokenRequestFile)
-
-		output, err := cmd.CombinedOutput()
-		g.Expect(err).NotTo(HaveOccurred())
-
-		By("parsing the JSON output to extract the token")
-		var token tokenRequest
-		err = json.Unmarshal(output, &token)
-		g.Expect(err).NotTo(HaveOccurred())
-
-		out = token.Status.Token
-	}
-	Eventually(verifyTokenCreation).Should(Succeed())
-
-	return out, err
-}
-
-// getMetricsOutput retrieves and returns the logs from the curl pod used to access the metrics endpoint.
-func getMetricsOutput() (string, error) {
-	By("getting the curl-metrics logs")
-	cmd := exec.Command("kubectl", "logs", "curl-metrics", "-n", namespace)
-	return utils.Run(cmd)
-}
-
-// tokenRequest is a simplified representation of the Kubernetes TokenRequest API response,
-// containing only the token field that we need to extract.
-type tokenRequest struct {
-	Status struct {
-		Token string `json:"token"`
-	} `json:"status"`
+	_, _ = fmt.Fprintf(GinkgoWriter, "%s:\n%s\n", title, out)
 }

@@ -1,4 +1,6 @@
-## Append samples of your project ##
+# The sample classes. Apply the sample namespaces (namespace_*.yaml) one by one, after the classes.
 resources:
-- namespaceclass_v1alpha1_namespaceclass.yaml
+- namespaceclass_v1alpha1_public-network.yaml
+- namespaceclass_v1alpha1_internal-network.yaml
+- namespaceclass_v1alpha1_team-baseline.yaml
 # +kubebuilder:scaffold:manifestskustomizesamples

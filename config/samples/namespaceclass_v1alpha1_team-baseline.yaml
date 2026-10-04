@@ -1,0 +1,46 @@
+apiVersion: namespaceclass.akuity.io/v1alpha1
+kind: NamespaceClass
+metadata:
+  name: team-baseline
+spec:
+  resources:
+    - apiVersion: v1
+      kind: ServiceAccount
+      metadata:
+        name: deployer
+    - apiVersion: v1
+      kind: ResourceQuota
+      metadata:
+        name: compute
+      spec:
+        hard:
+          requests.cpu: "4"
+          requests.memory: 8Gi
+          limits.cpu: "8"
+          limits.memory: 16Gi
+          pods: "20"
+    - apiVersion: v1
+      kind: LimitRange
+      metadata:
+        name: defaults
+      spec:
+        limits:
+          - type: Container
+            defaultRequest:
+              cpu: 100m
+              memory: 128Mi
+            default:
+              cpu: 500m
+              memory: 256Mi
+    - apiVersion: rbac.authorization.k8s.io/v1
+      kind: RoleBinding
+      metadata:
+        name: deployer-view
+      roleRef:
+        apiGroup: rbac.authorization.k8s.io
+        kind: ClusterRole
+        name: view
+      subjects:
+        # The subject has no namespace: it defaults to the namespace of the RoleBinding.
+        - kind: ServiceAccount
+          name: deployer

@@ -12,16 +12,9 @@ import (
 )
 
 const (
-	certmanagerVersion = "v1.21.1"
-	certmanagerURLTmpl = "https://github.com/cert-manager/cert-manager/releases/download/%s/cert-manager.yaml"
-
 	defaultKindBinary  = "kind"
 	defaultKindCluster = "kind"
 )
-
-func warnError(err error) {
-	_, _ = fmt.Fprintf(GinkgoWriter, "warning: %v\n", err)
-}
 
 // Run executes the provided command within this context
 func Run(cmd *exec.Cmd) (string, error) {
@@ -43,78 +36,17 @@ func Run(cmd *exec.Cmd) (string, error) {
 	return string(output), nil
 }
 
-// UninstallCertManager uninstalls the cert manager
-func UninstallCertManager() {
-	url := fmt.Sprintf(certmanagerURLTmpl, certmanagerVersion)
-	cmd := exec.Command("kubectl", "delete", "-f", url)
-	if _, err := Run(cmd); err != nil {
-		warnError(err)
-	}
-
-	// Delete leftover leases in kube-system (not cleaned by default)
-	kubeSystemLeases := []string{
-		"cert-manager-cainjector-leader-election",
-		"cert-manager-controller",
-	}
-	for _, lease := range kubeSystemLeases {
-		cmd = exec.Command("kubectl", "delete", "lease", lease,
-			"-n", "kube-system", "--ignore-not-found", "--force", "--grace-period=0")
-		if _, err := Run(cmd); err != nil {
-			warnError(err)
-		}
-	}
+// Kubectl runs kubectl with the given arguments and returns its output.
+func Kubectl(args ...string) (string, error) {
+	return Run(exec.Command("kubectl", args...))
 }
 
-// InstallCertManager installs the cert manager bundle.
-func InstallCertManager() error {
-	url := fmt.Sprintf(certmanagerURLTmpl, certmanagerVersion)
-	cmd := exec.Command("kubectl", "apply", "-f", url)
-	if _, err := Run(cmd); err != nil {
-		return err
-	}
-	// Wait for cert-manager-webhook to be ready, which can take time if cert-manager
-	// was re-installed after uninstalling on a cluster.
-	cmd = exec.Command("kubectl", "wait", "deployment.apps/cert-manager-webhook",
-		"--for", "condition=Available",
-		"--namespace", "cert-manager",
-		"--timeout", "5m",
-	)
-
+// KubectlApply applies the YAML manifest, which kubectl reads from its standard input.
+func KubectlApply(yaml string) error {
+	cmd := exec.Command("kubectl", "apply", "-f", "-")
+	cmd.Stdin = strings.NewReader(yaml)
 	_, err := Run(cmd)
 	return err
-}
-
-// IsCertManagerCRDsInstalled checks if any Cert Manager CRDs are installed
-// by verifying the existence of key CRDs related to Cert Manager.
-func IsCertManagerCRDsInstalled() bool {
-	// List of common Cert Manager CRDs
-	certManagerCRDs := []string{
-		"certificates.cert-manager.io",
-		"issuers.cert-manager.io",
-		"clusterissuers.cert-manager.io",
-		"certificaterequests.cert-manager.io",
-		"orders.acme.cert-manager.io",
-		"challenges.acme.cert-manager.io",
-	}
-
-	// Execute the kubectl command to get all CRDs
-	cmd := exec.Command("kubectl", "get", "crds")
-	output, err := Run(cmd)
-	if err != nil {
-		return false
-	}
-
-	// Check if any of the Cert Manager CRDs are present
-	crdList := GetNonEmptyLines(output)
-	for _, crd := range certManagerCRDs {
-		for _, line := range crdList {
-			if strings.Contains(line, crd) {
-				return true
-			}
-		}
-	}
-
-	return false
 }
 
 // LoadImageToKindClusterWithName loads a local docker image to the kind cluster

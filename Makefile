@@ -76,7 +76,8 @@ setup-test-e2e: kind
 
 .PHONY: test-e2e
 test-e2e: setup-test-e2e manifests generate fmt vet
-	KUBECONFIG="$(KIND_KUBECONFIG)" KIND="$(KIND)" KIND_CLUSTER="$(KIND_CLUSTER)" go test -tags=e2e ./test/e2e/ -v -ginkgo.v
+	KUBECONFIG="$(KIND_KUBECONFIG)" KIND="$(KIND)" KIND_CLUSTER="$(KIND_CLUSTER)" KIND_IMG="$(KIND_IMG)" \
+		go test -tags=e2e ./test/e2e/ -v -ginkgo.v -timeout 30m
 	$(MAKE) cleanup-test-e2e
 
 .PHONY: cleanup-test-e2e
